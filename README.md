@@ -4,73 +4,87 @@
 
 **Demo:** [2-minute walkthrough on YouTube](https://youtu.be/5-cMMQXlYo0?si=uo1Q_DZjigILzCZI) · **Live landing page:** [edge.gudman.xyz](https://edge.gudman.xyz)
 
-**Offline multimodal maintenance copilot for industrial technicians.**
+## What This Is
 
-Search by photo of a broken part, error code, voice note, manual snippet, or past incident. Get back evidence-backed fix recommendations — the relevant manual section, the closest historical incident, and the likely replacement part. Everything runs **locally, with no internet**, on a laptop.
+**Offline maintenance assistant for factory technicians.** Runs entirely on a laptop—no internet needed. You search by photo, error code, voice note, or manual text. System returns three things: the relevant manual page, a past similar incident (with fix + downtime), and the replacement part number. All traceable. No AI hallucination.
 
-> **For the Actian VectorAI DB Build Challenge.** FixFirst Edge uses all three of the Actian features the rubric asks for: **named vectors** for multimodal retrieval (text + image + audio in one collection), **filtered search** with indexed keyword fields, and **hybrid RRF fusion** across a dense ANN lane and an Actian-native identifier-filtered ANN lane. It runs **100% offline** on a 16 GB laptop, CPU-only (the ~1 GB model footprint also fits an 8 GB machine; not yet measured at that floor), with no outbound network calls in the diagnose path. CI builds and runs the backend test suite on **x86_64 and ARM64 Linux** on every commit. End-to-end p50 **~850 ms**, p95 **~1100 ms** (see [Benchmark](#benchmark)).
+**Built for Actian VectorAI DB Challenge.** Uses all three required features: named vectors (text + image + voice in one collection), filtered search (error codes, machine models, part numbers), and hybrid RRF fusion (dense embeddings + metadata-filtered retrieval combined). Runs 100% offline on a 16 GB laptop, CPU-only. No outbound calls in diagnosis path. Response time: **~850 ms median, ~1100 ms at 95th percentile** (see [Benchmark](#benchmark)).
 
 ---
 
-## Why Actian VectorAI DB
+## Why This Matters
 
-FixFirst Edge is built on three Actian VectorAI DB features that are genuinely differentiating for this problem:
+**Problem:** Industrial sites have bad connectivity. Technicians near broken machines often have no signal. Cloud "AI helpers" are also unauditable—you can't trace an LLM's answer back to the actual manual or the actual past incident.
 
-### 1. Named Vectors — true multimodal in one collection
+**Solution:** Everything local. Everything traceable. Search → returns linked evidence from three sources (manual + past incident + parts DB). Each line points to a real row in the database.
 
-One collection (`incidents`) holds three embedding spaces side-by-side:
+Example output:
+> **Manual:** conveyor_manual.pdf p.42 — "Error E04 indicates thermal overload on drive motor…"
+>
+> **Similar past incident:** CX-200 machine, same error. Fixed by replacing thermal overload relay and re-torquing motor mounts. Downtime: 45 min.
+>
+> **Part to order:** OL-E04-R (Thermal Overload Relay)
 
-| Vector | Model | Dim | Purpose |
+---
+
+## How It Uses Actian VectorAI DB
+
+Three features. Each solves a real problem:
+
+### 1. Named Vectors — One collection, three embedding spaces
+
+Single `incidents` collection holds three vector types side-by-side:
+
+| Vector | Model | Dims | What it searches |
 |---|---|---|---|
-| `text_vec` | BAAI/bge-small-en-v1.5 | 384 | Manual chunks, incident text, error-code descriptions |
-| `image_vec` | sentence-transformers/clip-ViT-B-32 | 512 | Photos of damaged parts |
-| `audio_text_vec` | bge-small-en-v1.5 over whisper transcripts | 384 | Voice notes |
+| `text_vec` | BAAI/bge-small-en-v1.5 | 384 | Manual text, incident descriptions, error codes |
+| `image_vec` | sentence-transformers/clip-ViT-B-32 | 512 | Photos of damaged parts, schematics |
+| `audio_text_vec` | bge-small-en (over whisper transcripts) | 384 | Voice notes from technicians |
 
-No separate collections, no cross-store joins. A single document (e.g. an image-tagged incident) can carry both `text_vec` and `image_vec` and be retrievable through either modality. See [`backend/app/db.py`](backend/app/db.py) — `init_collection()` creates the three-vector schema, `upsert()` accepts any subset of the three.
+No separate collections. No joining across stores. One document can carry all three vectors. Search by text, image, or voice—all hit the same collection. See [`backend/app/db.py`](backend/app/db.py) — `init_collection()` builds the schema, `upsert()` accepts any mix of vectors.
 
-### 2. Filtered Search — keyword-indexed metadata
+### 2. Filtered Search — Keyword metadata narrows results
 
-Every query can be narrowed by `doc_type`, `machine_type`, `model_no`, `fault_code`, `severity`, or `part_no`. Filters are built with `FilterBuilder` against keyword-indexed fields. The `diagnose` endpoint uses this aggressively — e.g. it narrows part recommendations to only parts that fit the matched machine's model. See [`backend/app/db.py:_build_filter`](backend/app/db.py) and [`backend/app/services/search_service.py`](backend/app/services/search_service.py).
+Every query filtered by: machine type, model number, error code, part number, fault severity, doc type. Filters are indexed. Means a part recommendation for a "CX-200 with error E04" only returns parts that fit that exact machine and code. See [`backend/app/db.py:_build_filter`](backend/app/db.py) and [`backend/app/services/search_service.py`](backend/app/services/search_service.py).
 
-### 3. Hybrid Fusion (RRF) — dense + identifier-native in one query
+### 3. Hybrid Fusion (RRF) — Dense embeddings + exact metadata match in one query
 
-Text search uses **reciprocal rank fusion** over:
-- `text_vec` dense ANN (top-50)
-- a second Actian-native retrieval lane that re-runs ANN with exact metadata filters extracted from the query (`fault_code`, `model_no`, `part_no`)
+Text search runs **reciprocal rank fusion** across two lanes:
+- Dense ANN on `text_vec` (top-50 dense hits)
+- Actian-native lane: re-runs ANN with strict metadata filters (`fault_code`, `model_no`, `part_no`) extracted from query
 
-At ingest time, manuals, incidents, voice notes, and parts backfill those identifiers into indexed metadata fields. Merged with RRF (k=60), top-k returned. This matters for maintenance: the error code `E04` and identifiers like `CX-200` or `OL-E04-R` are promoted through exact Actian-side filters, while symptom phrases like "motor tripped on overload" are still captured by the dense branch. See [`backend/app/db.py:search_hybrid`](backend/app/db.py).
-
----
-
-## How multimodal diagnose actually works
-
-`/api/diagnose` always returns three evidence slots — the manual section, the similar incident, and the candidate part — regardless of which modality the user submitted. Getting there looks different depending on the input, and the design leans on Actian's **filter-indexed metadata as a shared case graph** rather than forcing a single embedding space to do everything:
-
-- **Text query** → hybrid RRF directly. Dense ANN over `text_vec` plus the identifier-filtered ANN lane described above. Both branches run against the same collection, so a query like "E04 motor overload on CX-200" lands on the manual chunk, the incident, and the part in one fused pass.
-
-- **Voice query** → transcribed locally by `faster-whisper` (tiny.en, CPU) into text, then run through the same hybrid path. In addition, `audio_text_vec` ANN is fused in so voice notes that were previously ingested (with their own transcripts embedded) surface even if the transcription wording differs.
-
-- **Image query** → `image_vec` ANN over the CLIP space finds the nearest labeled schematic or image-tagged incident. The hit's indexed metadata — `model_no`, `fault_code`, `machine_type` — then becomes the seed for the text hybrid path, which fetches the corresponding manual section, incident, and part.
-
-The image→text bridge is deliberate, not a fallback. Pure image-space diagnosis is a weak signal in maintenance: two schematics can look nearly identical but belong to different fault classes, and parts are identified by numbers, not pixels. What carries diagnostic signal is the **metadata that was filed with the image at ingest** (`model_no`, `fault_code`, technician notes). Actian's filtered search is what lets a one-shot image match become a structured entry point into the manual/incident/part graph. See [`backend/app/services/search_service.py:diagnose`](backend/app/services/search_service.py).
-
-This is also why the hackathon's **filtered search** feature is central to the product, not decorative: it's the glue that turns three independent vector spaces into one cross-modal case graph.
+At ingest, manuals/incidents/parts backfill those identifiers into indexed fields. RRF merges both lanes (k=60). This matters: error code `E04` and part ID `CX-200` get boosted by exact filters, while symptom phrases like "motor tripped" still match via dense embeddings. See [`backend/app/db.py:search_hybrid`](backend/app/db.py).
 
 ---
 
-## Why offline-only
+## How Diagnosis Works Across Modalities
 
-Industrial sites have poor connectivity and strict data-egress rules. A plant tech's phone often has no signal near the machine. Cloud-backed "AI assistants" are also unauditable — a diagnostic answer generated by an LLM can't be traced back to a specific manual page or a specific prior incident.
+`/api/diagnose` returns three things—manual section, past incident, candidate part—regardless of input type. Here's the flow per modality:
 
-FixFirst Edge responds with **templated evidence**, not LLM prose:
+### Text query
+Hybrid RRF directly. Dense ANN + identifier-filtered ANN, both lanes in one collection. Example: "E04 motor overload on CX-200" → hits manual chunk + incident + part in one fused pass.
 
-> Per conveyor_manual.pdf p.42: "Error E04 indicates thermal overload on the drive motor…"
->
-> Previous incident on CX-200 resolved by: Replaced thermal overload relay and re-torqued motor mounts (downtime: 45 min)
->
-> Likely replacement part: OL-E04-R (Thermal Overload Relay)
+### Voice query
+Transcribed locally (faster-whisper, tiny.en model, CPU) to text. Same hybrid path as text. Also fuses `audio_text_vec` ANN so prior voice notes surface even if wording differs.
 
-Every line traceable to a row in Actian. No hallucination surface.
+### Image query
+`image_vec` ANN (CLIP space) finds nearest schematic or tagged incident photo. Hit's metadata (`model_no`, `fault_code`, `machine_type`) becomes seed for text hybrid path. Text hybrid then fetches manual + incident + part.
+
+**Why image→text bridge?** Pure image diagnosis is weak. Two schematics look similar but belong to different faults. Parts are ID'd by number, not pixels. Real signal is the **metadata filed with the image** (`model_no`, `fault_code`, technician notes). Actian's filters let one photo match unlock the full case graph (manual/incident/part). See [`backend/app/services/search_service.py:diagnose`](backend/app/services/search_service.py).
+
+This is why filtered search is core, not decoration. It's the glue turning three separate vector spaces into one cross-modal case graph.
+
+---
+
+## Why Offline-Only
+
+**Connectivity:** Plants have poor signal. Techs near machines often disconnected.
+
+**Auditability:** Cloud LLMs generate untrackable prose. Technician can't verify against actual manual. FixFirst returns structured evidence—every line traceable to a manual page or a past incident row.
+
+**Data egress:** Many industrial sites forbid sending photos/error logs to cloud.
+
+**Reliability:** Works even if cloud API is down or slow.
 
 ---
 
@@ -107,10 +121,10 @@ Every line traceable to a row in Actian. No hallucination surface.
 
 ### Stack
 
-- **DB**: Actian VectorAI DB (Docker image `williamimoh/actian-vectorai-db:latest`)
-- **Backend**: Python 3.11/3.12 + FastAPI + pdfplumber + sentence-transformers + faster-whisper
-- **Frontend**: Next.js 14 (App Router) + TypeScript + Tailwind CSS
-- **Embeddings**: all local, CPU only, ~1.3 GB cached on first run
+- **DB**: Actian VectorAI DB (Docker)
+- **Backend**: Python 3.11/3.12, FastAPI, pdfplumber, sentence-transformers, faster-whisper
+- **Frontend**: Next.js 14 (App Router), TypeScript, Tailwind CSS
+- **Models**: All local, CPU-only, ~1.3 GB cached on first run
 
 ---
 
@@ -121,7 +135,7 @@ Every line traceable to a row in Actian. No hallucination surface.
 - Docker
 - Python 3.11 or 3.12
 - Node 20+
-- ~2 GB disk for model weights on first run
+- ~2 GB disk for model cache (first run)
 
 ### 1. Start Actian
 
@@ -129,61 +143,61 @@ Every line traceable to a row in Actian. No hallucination surface.
 docker compose up -d actian
 ```
 
-Or manually:
+Or standalone:
 
 ```bash
 docker run -d --name vectoraidb -p 50051:50051 \
   --restart unless-stopped williamimoh/actian-vectorai-db:latest
 ```
 
-**One-command full stack** (Actian + backend + frontend, for a judge or reviewer reproducing the app without HMR):
+Full stack one command (all services + auto-build):
 
 ```bash
 docker compose --profile full up --build
 ```
 
-**Landing-page deployment** (static marketing site, for the public submission link):
-
-- The canonical landing page is hosted at [edge.gudman.xyz](https://edge.gudman.xyz) on a VPS with Let's Encrypt.
-- `.github/workflows/deploy-landing-pages.yml` publishes a mirror to `https://Ridwannurudeen.github.io/fixfirst-edge/` as a backup (no custom domain — DNS for `edge.gudman.xyz` stays on the VPS).
-- The share/cover asset lives at `landing/cover.svg`.
+Landing page (static marketing, hosted at [edge.gudman.xyz](https://edge.gudman.xyz)):
+- `.github/workflows/deploy-landing-pages.yml` publishes mirror to GitHub Pages as fallback
+- Cover asset: `landing/cover.svg`
 
 ### 2. Install backend
 
 ```bash
 cd backend
-python3.11 -m venv .venv && source .venv/bin/activate   # or python3.12
-pip install /path/to/actian_vectorai-0.1.0b2-py3-none-any.whl
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install /path/to/actian_vectorai-0.1.0b2-py3-none-any.whl  # Actian beta wheel first
 pip install -r requirements.txt
 ```
 
-Use Python 3.11 or 3.12. `requirements.txt` pins `actian-vectorai==0.1.0b2`, but the SDK wheel must be installed from the Actian/organizer-provided beta package before running the requirements install. If the wheel is already installed, `pip install -r requirements.txt` treats the requirement as satisfied.
+**Note:** Requires Python 3.11 or 3.12. SDK wheel must install before `requirements.txt` (requirements.txt pins `actian-vectorai==0.1.0b2`).
 
 ### 3. Seed data
 
-Drop files into `data/raw/`:
+Place files in `data/raw/`:
 
-- `manuals/*.pdf` — equipment manuals
-- `images/*.{jpg,png}` — photos of damaged parts
-- `voice/*.wav` — 16 kHz mono voice notes
-- `incidents.csv` — columns: `id,machine_type,model_no,fault_code,severity,symptom,fix_applied,downtime_min,parts_used`
-- `parts.csv` — columns: `part_no,name,machine_type,model_no`
-- `error_codes.csv` — columns: `fault_code,machine_type,description`
+```
+manuals/*.pdf               → equipment docs
+images/*.{jpg,png}          → damage photos
+voice/*.wav                 → voice notes (16 kHz mono)
+incidents.csv               → columns: id, machine_type, model_no, fault_code, severity, symptom, fix_applied, downtime_min, parts_used
+parts.csv                   → columns: part_no, name, machine_type, model_no
+error_codes.csv             → columns: fault_code, machine_type, description
+```
 
-Sample fixture CSVs are in [`data/fixtures/`](data/fixtures/). Copy them into `data/raw/` to try the pipeline, then replace with real data:
+Sample fixtures in [`data/fixtures/`](data/fixtures/). Quick start:
 
 ```bash
 cp data/fixtures/*.csv data/raw/
 ```
 
-To regenerate the full demo corpus (3 PDF service manuals, 6 schematic images, 5 voice notes) from the fixtures:
+Generate full demo corpus (3 PDFs, 6 images, 5 voice notes) offline:
 
 ```bash
 pip install reportlab pillow pyttsx3
 python scripts/gen_demo_assets.py
 ```
 
-Outputs land in `data/raw/manuals/`, `data/raw/images/`, `data/raw/voice/`. The generator is offline — no models or network needed.
+Outputs → `data/raw/manuals/`, `data/raw/images/`, `data/raw/voice/` (no models, no network).
 
 ### 4. Run backend + ingest
 
@@ -201,9 +215,9 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:3000.
+Open http://localhost:3000
 
-The frontend targets `http://localhost:8000` by default for local development. For split deployments, set `NEXT_PUBLIC_API_URL` explicitly. The backend allows local browser requests from `http://localhost:3000` and `http://127.0.0.1:3000` by default. Override with `CORS_ORIGINS` if you need a different frontend origin.
+Frontend defaults to `http://localhost:8000` backend. For split deployments, set `NEXT_PUBLIC_API_URL` env var. Backend allows CORS from `localhost:3000` and `127.0.0.1:3000` by default. Override with `CORS_ORIGINS`.
 
 ### 6. Verify offline
 
@@ -212,19 +226,19 @@ cd backend
 python scripts/verify_offline.py
 ```
 
-The verifier exercises `/api/health` plus the real `/api/diagnose` flow for text, image, and voice. If image or voice fixtures are missing under `data/raw/`, those checks print `SKIP` instead of pretending the system was verified. Disconnect WiFi after ingest — the app keeps working. The status banner now has three honest states: **OFFLINE — Ready locally** when Actian is reachable and the `incidents` collection is initialized, **OFFLINE — Local DB not initialized** when the backend is up but the collection is missing, and **OFFLINE — Local API unavailable** when the frontend cannot reach the backend at all.
+Tests `/api/health` + full `/api/diagnose` flow (text, image, voice). Skips image/voice checks if fixtures missing. Disconnect WiFi after ingest—app keeps working. Status banner shows: **OFFLINE — Ready locally** (Actian up, collection ready), **OFFLINE — Local DB not initialized** (backend up, collection missing), or **OFFLINE — Local API unavailable** (frontend can't reach backend).
 
 ---
 
-## API
+## API Reference
 
-The Next.js UI is built around a single unified entry point — `POST /api/diagnose` — that fuses text, image, and voice in one request and returns evidence + templated recommendation. The `/api/search/*` endpoints are the lower-level developer API surface, exposing each modality and filter independently for programmatic use.
+Main entry point: `POST /api/diagnose` (fuses text + image + voice, returns templated evidence). Lower-level endpoints expose each modality + filters separately for programmatic use.
 
-| Method | Path | Purpose |
+| Method | Path | Does |
 |---|---|---|
 | GET | `/api/health` | `{status, online, db, collection_ready}` |
 | POST | `/api/ingest/manual` | multipart: PDF + machine_type + model_no |
-| POST | `/api/ingest/incident` | JSON row → auto-detects incident vs. error_code |
+| POST | `/api/ingest/incident` | JSON row → auto-detects incident vs error_code |
 | POST | `/api/ingest/image` | multipart: image + machine_type + optional model_no/fault_code/severity/part_no |
 | POST | `/api/ingest/voice` | multipart: WAV + machine_type |
 | POST | `/api/ingest/part` | JSON row |
@@ -245,63 +259,63 @@ pytest tests -q
 # 21 passed
 ```
 
-All pipelines unit-tested with fake embedders / mock search results (no network, no models needed for CI).
+All pipelines unit-tested (mock embedders, no network, no models needed for CI).
 
 ## Benchmark
 
-End-to-end `/api/diagnose` latency, warmed, over 20 mixed queries (error codes, part numbers, symptom phrases, machine IDs) against the full demo corpus — **3 PDF service manuals, 30 incidents, 25 parts, 13 error codes, 6 schematic images, 5 voice notes**. Runs on a 16 GB laptop, CPU-only, WSL2 + Docker, all models local:
+End-to-end `/api/diagnose` latency over 20 mixed queries (error codes, part numbers, symptoms, machine IDs) against full demo corpus (3 PDFs, 30 incidents, 25 parts, 13 error codes, 6 images, 5 voice notes). 16 GB laptop, CPU-only, WSL2 + Docker, all models local:
 
-| metric | ms |
+| Metric | ms |
 |---|---|
-| p50 | **843** |
-| p95 | **1093** |
+| **p50** | 843 |
+| **p95** | 1093 |
 | mean | 900 |
 | min | 781 |
 | max | 1094 |
 
-Numbers are stable across three consecutive runs (tightest cluster: p50 843–859 ms, p95 1081–1120 ms) on a fresh Actian collection after `bulk_ingest`. Each request embeds the query, runs hybrid RRF (dense + identifier-filtered ANN), then runs three more filter-scoped retrievals for the manual/incident/part slots — nine total vector operations per user query. Headroom exists: larger corpus + GPU embedding would trade differently.
+Stable across 3 runs. Each request: embeds query → hybrid RRF (dense + identifier-filtered ANN) → 3 per-slot retrievals (manual/incident/part) = 9 vector ops per request. 20/20 queries returned full evidence set. Reproduce: `python backend/scripts/bench_diagnose.py`.
 
-20/20 queries returned a full evidence set (manual section + similar incident + candidate part). Every request exercises: query-text embedding → hybrid RRF (dense ANN + identifier-filtered ANN) → three additional per-slot retrievals for manual/incident/part. Reproduce with `python backend/scripts/bench_diagnose.py`.
+---
 
 ## Submission Readiness
 
-Before final DoraHacks submission, run:
+Before DoraHacks final submission:
 
 ```bash
 python scripts/check_submission_readiness.py
 ```
 
-It fails if the repo still contains placeholder demo/team/cover fields or if the landing page is still using the fallback demo block instead of a real embed.
+Fails if repo contains placeholder demo/team fields or landing page still using fallback block instead of real embed.
 
 ---
 
-## Project structure
+## Project Structure
 
 ```
 fixfirst-edge/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py              # FastAPI app
-│   │   ├── config.py            # env-driven settings
-│   │   ├── db.py                # Actian abstraction (named vectors, filtered, hybrid RRF)
-│   │   ├── schemas.py           # pydantic request/response models
+│   │   ├── config.py            # env settings
+│   │   ├── db.py                # Actian wrapper (named vectors, filters, hybrid RRF)
+│   │   ├── schemas.py           # pydantic models
 │   │   ├── routers/             # ingest, search, diagnose, health
-│   │   ├── pipelines/           # text/image/audio/pdf/csv
-│   │   └── services/            # ingest_service, search_service, diagnose_service
+│   │   ├── pipelines/           # text/image/audio/pdf/csv processors
+│   │   └── services/            # ingest, search, diagnose logic
 │   ├── scripts/
 │   │   ├── bulk_ingest.py       # walks data/raw/, calls ingest endpoints
-│   │   ├── verify_offline.py    # offline diagnose verifier
-│   │   └── pull_actian.sh       # retry loop for docker.io pulls
+│   │   ├── verify_offline.py    # diagnose verifier
+│   │   └── pull_actian.sh       # docker pull retry
 │   └── tests/
 ├── frontend/
 │   ├── app/page.tsx             # single-page UI
-│   ├── components/              # UploadZone, SearchBar, FilterPanel, DiagnosePanel, ...
+│   ├── components/              # UploadZone, SearchBar, FilterPanel, DiagnosePanel, …
 │   └── lib/api.ts               # typed fetch wrapper
 ├── data/
 │   ├── raw/                     # owner-supplied + fixture CSVs
 │   └── processed/               # model cache (gitignored)
 ├── docker-compose.yml
-└── CODEX_BRIEF.md               # implementation plan used to build this
+└── CODEX_BRIEF.md               # implementation plan
 ```
 
 ---
