@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Ridwannurudeen/fixfirst-edge/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Ridwannurudeen/fixfirst-edge/actions/workflows/ci.yml)
 
-**Demo:** [2-minute walkthrough on YouTube](https://youtu.be/eKGRRkdDurA) · **Live landing page:** [edge.gudman.xyz](https://edge.gudman.xyz)
+**Demo:** [2-minute walkthrough on YouTube](https://youtu.be/5-cMMQXlYo0?si=uo1Q_DZjigILzCZI) · **Live landing page:** [edge.gudman.xyz](https://edge.gudman.xyz)
 
 **Offline multimodal maintenance copilot for industrial technicians.**
 
